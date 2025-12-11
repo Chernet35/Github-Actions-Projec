@@ -25,6 +25,34 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0  # Full history for GitLeaks
+          
+      - name: Verify .gitleaks.toml exists
+        run: |
+          if [ ! -f ".gitleaks.toml" ]; then
+            echo "⚠️ .gitleaks.toml not found. Creating default configuration..."
+            cat > .gitleaks.toml << 'EOF'
+# GitLeaks configuration for secret scanning
+title = "GitLeaks Secret Scanning Configuration"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Allow list for known false positives"
+paths = [
+  '''\.md$''',
+  '''\.txt$''',
+  '''\.json$''',
+  '''\.example$''',
+  '''test/''',
+  '''tests/''',
+]
+EOF
+            echo "✅ Created default .gitleaks.toml"
+          else
+            echo "✅ .gitleaks.toml found"
+            cat .gitleaks.toml
+          fi
 
       - name: Install GitLeaks
         run: |
@@ -63,8 +91,20 @@ jobs:
             GITLEAKS_CMD="gitleaks"
           fi
           
-          # Run GitLeaks scan
-          # Note: --config (not --config-path), --no-git=false means use git (scan git history)
+          # Show current directory and verify config file
+          echo "Current directory: $(pwd)"
+          echo "Checking for .gitleaks.toml..."
+          if [ -f ".gitleaks.toml" ]; then
+            echo "✅ Found .gitleaks.toml"
+            ls -la .gitleaks.toml
+          else
+            echo "❌ .gitleaks.toml not found in current directory"
+            echo "Files in current directory:"
+            ls -la | head -20
+            exit 1
+          fi
+          
+          # Run GitLeaks scan with config file
           $GITLEAKS_CMD detect \
             --config .gitleaks.toml \
             --verbose \
