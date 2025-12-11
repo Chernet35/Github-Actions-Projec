@@ -64,12 +64,11 @@ jobs:
           fi
           
           # Run GitLeaks scan
+          # Note: --config (not --config-path), --no-git=false means use git (scan git history)
           $GITLEAKS_CMD detect \
-            --config-path .gitleaks.toml \
+            --config .gitleaks.toml \
             --verbose \
-            --no-git=false \
             --exit-code 1 \
-            --severity-threshold high \
             --source .
 
   # ============================================================
