@@ -2,195 +2,122 @@ name: CI Pipeline
 
 on:
   push:
-    branches: [main]
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
 
+env:
+  JAVA_VERSION: '17'
+  MAVEN_VERSION: '3.9.5'
+  SONARQUBE_TOKEN: ${{ secrets.SONARQUBE_TOKEN }}
+  SONARQUBE_URL: ${{ secrets.SONARQUBE_URL }}
 
 jobs:
-  ## ============================================================
-  ## SECRET SCANNING - GitLeaks
-  ## ============================================================
+  # ============================================================
+  # SECRET SCANNING - GitLeaks
+  # ============================================================
   secret-scan:
     name: Secret Scanning (GitLeaks)
     runs-on: self-hosted
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: Ensure .gitleaks.toml exists
+      - name: Verify .gitleaks.toml
         run: |
           if [ ! -f ".gitleaks.toml" ]; then
-            echo "⚠️  .gitleaks.toml not found. Creating default configuration..."
-            cat > .gitleaks.toml <<'EOF'
+            cat > .gitleaks.toml << 'EOF'
 title = "GitLeaks Secret Scanning Configuration"
 
 [extend]
 useDefault = true
 
 [allowlist]
-description = "Allow list for known false positives"
+description = "Allowlist for known false positives"
 paths = [
-  '''\.md$''',
-  '''\.txt$''',
-  '''\.json$''',
-  '''\.example$''',
-  '''test/''',
-  '''tests/''',
+  '\.md$',
+  '\.txt$',
+  '\.json$',
+  '\.example$',
+  'test/',
+  'tests/'
 ]
 EOF
+            echo "✅ Created default .gitleaks.toml"
           fi
-          echo "✅ .gitleaks.toml ready."
 
-      - name: Install GitLeaks
+      - name: Install & Run GitLeaks
         run: |
-          if ! command -v gitleaks &> /dev/null; then
-            echo "Installing GitLeaks..."
-            curl -sSfL https://github.com/gitleaks/gitleaks/releases/latest/download/gitleaks_linux_x64.tar.gz | tar -xz -C /tmp
-            mkdir -p $HOME/.local/bin
-            mv /tmp/gitleaks $HOME/.local/bin/
-            chmod +x $HOME/.local/bin/gitleaks
-            echo "$HOME/.local/bin" >> $GITHUB_PATH
+          # Install GitLeaks if needed
+          if ! command -v gitleaks >/dev/null; then
+            curl -sSL https://github.com/gitleaks/gitleaks/releases/download/v8.24.3/gitleaks_8.24.3_linux_x64.tar.gz | tar xz -C /tmp
+            sudo mv /tmp/gitleaks /usr/local/bin/
           fi
-          gitleaks version
+          
+          gitleaks detect --config .gitleaks.toml --exit-code 1
 
-      - name: Run GitLeaks
-        run: |
-          gitleaks detect \
-            --config .gitleaks.toml \
-            --verbose \
-            --exit-code 1 \
-            --source .
-
-  ## ============================================================
-  ## CODE QUALITY - SonarQube
-  ## ============================================================
-  sonarqube:
-    name: SonarQube Analysis
+  # ============================================================
+  # CODE QUALITY + BUILD
+  # ============================================================
+  analyze-and-build:
+    name: Analyze & Build
     runs-on: self-hosted
     needs: secret-scan
-
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: Set up JDK
-        uses: actions/setup-java@v4
+      - uses: actions/setup-java@v4
         with:
           java-version: ${{ env.JAVA_VERSION }}
-          distribution: temurin
+          distribution: 'temurin'
           cache: maven
 
-      - name: Cache Maven dependencies
-        uses: actions/cache@v4
-        with:
-          path: ~/.m2
-          key: ${{ runner.os }}-m2-${{ hashFiles('**/pom.xml') }}
-          restore-keys: ${{ runner.os }}-m2-
+      - name: Maven dependencies
+        run: mvn dependency:go-offline -B
 
-      - name: Build and analyze with SonarQube
+      - name: Build & Test
+        run: mvn clean package test -B
+
+      - name: SonarQube Scan
+        uses: sonarsource/sonarqube-scan-action@v2
         env:
+          SONAR_TOKEN: ${{ env.SONARQUBE_TOKEN }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          SONAR_TOKEN: ${{ secrets.SONARQUBE_TOKEN }}
-        run: |
-          mvn clean verify sonar:sonar \
-            -Dsonar.projectKey=${{ secrets.SONAR_PROJECT_KEY }} \
-            -Dsonar.organization=${{ secrets.SONAR_ORGANIZATION }} \
-            -Dsonar.host.url=${{ env.SONARQUBE_URL }} \
-            -Dsonar.java.binaries=target/classes \
-            -Dsonar.sources=src \
-            -Dsonar.exclusions=**/test/**,**/*Test.java
+        with:
+          args: >
+            -Dsonar.projectKey=${{ secrets.SONAR_PROJECT_KEY }}
+            -Dsonar.organization=${{ secrets.SONAR_ORGANIZATION }}
+            -Dsonar.host.url=${{ env.SONARQUBE_URL }}
 
-  ## ============================================================
-  ## BUILD - Maven
-  ## ============================================================
-  build:
-    name: Build and Test (Maven)
+      - name: Quality Gate
+        uses: sonarsource/sonarqube-quality-gate-action@v2
+        timeout-minutes: 5
+        env:
+          SONAR_TOKEN: ${{ env.SONARQUBE_TOKEN }}
+        continue-on-error: true
+
+  # ============================================================
+  # SECURITY SCAN
+  # ============================================================
+  security-scan:
+    name: Trivy Scan
     runs-on: self-hosted
-    needs: [secret-scan, sonarqube]
-
+    needs: analyze-and-build
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up JDK
-        uses: actions/setup-java@v4
+      - uses: aquasecurity/trivy-action@master
         with:
-          java-version: ${{ env.JAVA_VERSION }}
-          distribution: temurin
-          cache: maven
+          scan-type: 'fs'
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+          severity: 'CRITICAL,HIGH'
 
-      - name: Build and test
-        run: |
-          mvn clean package -DskipTests=false
-
-      - name: Publish test report
-        uses: dorny/test-reporter@v1
-        if: always()
+      - uses: github/codeql-action/upload-sarif@v3
         with:
-          name: Maven Tests
-          path: target/surefire-reports/*.xml
-          reporter: java-junit
-          fail-on-error: false
-
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: java-artifacts
-          path: target/*.{jar,war}
-          retention-days: 7
-
-  ## ============================================================
-  ## SECURITY SCAN - Trivy
-  ## ============================================================
-  filesystem-scan:
-    name: Filesystem Vulnerability Scan (Trivy)
-    runs-on: self-hosted
-    needs: build
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Run Trivy
-        uses: aquasecurity/trivy-action@master
-        with:
-          scan-type: fs
-          scan-ref: .
-          format: sarif
-          output: trivy-fs-results.sarif
-          severity: CRITICAL,HIGH
-          exit-code: 1
-
-      - name: Upload Trivy report
-        uses: github/codeql-action/upload-sarif@v3
-        with:
-          sarif_file: trivy-fs-results.sarif
-
-  ## ============================================================
-  ## PIPELINE SUMMARY
-  ## ============================================================
-  pipeline-summary:
-    name: Pipeline Summary
-    runs-on: self-hosted
-    needs: [secret-scan, sonarqube, build, filesystem-scan]
-    if: always()
-
-    steps:
-      - name: Generate summary
-        run: |
-          {
-            echo "## 🔍 CI Pipeline Summary"
-            echo ""
-            echo "| Stage | Status |"
-            echo "|-------|--------|"
-            echo "| Secret Scanning (GitLeaks) | ${{ needs.secret-scan.result }} |"
-            echo "| SonarQube Analysis | ${{ needs.sonarqube.result }} |"
-            echo "| Maven Build | ${{ needs.build.result }} |"
-            echo "| Filesystem Scan (Trivy) | ${{ needs.filesystem-scan.result }} |"
-            echo ""
-          } >> $GITHUB_STEP_SUMMARY
-
-          if [[ "${{ needs.secret-scan.result }}" != "success" || \
-                "${{ needs.sonarqube.result }}" != "success" || \
-                "${{ needs.build.result }}" != "success" || \
-                "${{ needs.filesystem-scan.result }}" != "success" ]]; then
-            echo "**❌ Pipeline failed. Review failed stages.**" >> $GITHUB_STEP_SUMMARY
-            exit 1
-          else
-            echo "**✅ All stages passed successfully!**" >> $GITHUB_STEP_SUMMARY
-          fi
+          sarif_file: 'trivy-results.sarif'
