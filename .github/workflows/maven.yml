@@ -80,7 +80,7 @@ EOF
           
           # Verify installation
           $HOME/.local/bin/gitleaks version || gitleaks version
-
+          
       - name: Run GitLeaks
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -292,4 +292,3 @@ EOF
           else
             echo "✅ All pipeline stages passed successfully!" >> $GITHUB_STEP_SUMMARY
           fi
-
