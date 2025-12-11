@@ -5,90 +5,207 @@ on:
     branches: [ "main" ]
 
 jobs:
-  compile:
+  # ============================================================
+  # SECRET SCANNING - GitLeaks
+  # ============================================================
+  secret-scan:
+    name: Secret Scanning (GitLeaks)
     runs-on: self-hosted
-
     steps:
-    - uses: actions/checkout@v4
-    - name: Set up JDK 17
-      uses: actions/setup-java@v4
-      with:
-        java-version: '17'
-        distribution: 'temurin'
-        cache: maven
-    - name: Build with Maven
-      run: mvn compile
-      
-  security-check:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Full history for GitLeaks
+
+      - name: Run GitLeaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          config-path: .gitleaks.toml
+          no-git: false
+          exit-code: 1
+          severity-threshold: high
+
+  # ============================================================
+  # CODE QUALITY - SonarQube
+  # ============================================================
+  sonarqube:
+    name: SonarQube Analysis
     runs-on: self-hosted
-    needs: compile
-
+    needs: secret-scan
     steps:
-    - uses: actions/checkout@v4
-    - name: Trivy Installation
-      run: |
-        sudo apt-get install -y wget apt-transport-https gnupg lsb-release
-        wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key | sudo apt-key add -
-        echo deb https://aquasecurity.github.io/trivy-repo/deb $(lsb_release -sc) main | sudo tee -a /etc/apt/sources.list.d/trivy.list
-        sudo apt-get update -y
-        sudo apt-get install -y trivy
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Shallow clones should be disabled for better analysis
 
-    - name: Trivy FS Scan
-      run: trivy fs --format table -o fs-report.json .
+      - name: Set up JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: 'temurin'
+          cache: maven
 
-    - name: Gitleaks Installation
-      run: sudo apt install gitleaks -y
-    - name: Gitleaks Code Scan
-      run: gitleaks detect source . -r gitleaks-report.json -f json
+      - name: Cache Maven dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.m2
+          key: ${{ runner.os }}-m2-${{ hashFiles('**/pom.xml') }}
+          restore-keys: |
+            ${{ runner.os }}-m2-
 
-  test:
+      - name: Download Maven dependencies
+        run: mvn dependency:go-offline -B
+
+      - name: Build with Maven
+        run: mvn clean compile -B
+
+      - name: Run SonarQube Scanner
+        uses: sonarsource/sonarqube-scan-action@master
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SONAR_TOKEN: ${{ env.SONARQUBE_TOKEN }}
+        with:
+          args: >
+            -Dsonar.projectKey=${{ secrets.SONAR_PROJECT_KEY }}
+            -Dsonar.organization=${{ secrets.SONAR_ORGANIZATION }}
+            -Dsonar.host.url=${{ env.SONARQUBE_URL }}
+            -Dsonar.java.binaries=target/classes
+            -Dsonar.sources=src
+            -Dsonar.exclusions=**/test/**,**/*Test.java
+
+      - name: Wait for SonarQube Quality Gate
+        id: sonarqube-quality-gate-check
+        uses: sonarsource/sonarqube-quality-gate-action@master
+        timeout-minutes: 5
+        env:
+          SONAR_TOKEN: ${{ env.SONARQUBE_TOKEN }}
+        continue-on-error: true
+
+      - name: Check Quality Gate status
+        if: steps.sonarqube-quality-gate-check.outcome == 'failure'
+        run: |
+          echo "❌ SonarQube Quality Gate FAILED"
+          echo "Please review the SonarQube dashboard and fix the issues."
+          exit 1
+
+      - name: Quality Gate passed
+        if: steps.sonarqube-quality-gate-check.outcome == 'success'
+        run: |
+          echo "✅ SonarQube Quality Gate PASSED"
+
+  # ============================================================
+  # BUILD - Maven
+  # ============================================================
+  build:
+    name: Build Java Application
     runs-on: self-hosted
-    needs: security-check
+    needs: [secret-scan, sonarqube]
     steps:
-    - uses: actions/checkout@v4
-    - name: Set up JDK 17
-      uses: actions/setup-java@v4
-      with:
-        java-version: '17'
-        distribution: 'temurin'
-        cache: maven
-    - name: Unit Test Cases
-      run: mvn test
+      - name: Checkout code
+        uses: actions/checkout@v4
 
-  build_project_and_sonar_scan:
+      - name: Set up JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: 'temurin'
+          cache: maven
+
+      - name: Cache Maven dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.m2
+          key: ${{ runner.os }}-m2-${{ hashFiles('**/pom.xml') }}
+          restore-keys: |
+            ${{ runner.os }}-m2-
+
+      - name: Download Maven dependencies
+        run: mvn dependency:go-offline -B
+
+      - name: Build with Maven
+        run: mvn clean package -B -DskipTests
+
+      - name: Run unit tests
+        run: mvn test -B
+
+      - name: Generate test report
+        uses: dorny/test-reporter@v1
+        if: success() || failure()
+        with:
+          name: Maven Tests
+          path: target/surefire-reports/*.xml
+          reporter: java-junit
+          fail-on-error: false
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: java-artifacts
+          path: |
+            target/*.jar
+            target/*.war
+          retention-days: 7
+
+  # ============================================================
+  # SECURITY SCAN - Trivy Filesystem
+  # ============================================================
+  filesystem-scan:
+    name: Filesystem Vulnerability Scan (Trivy)
     runs-on: self-hosted
-    needs: test
+    needs: build
     steps:
-    - uses: actions/checkout@v4
-    - name: Set up JDK 17
-      uses: actions/setup-java@v4
-      with:
-        java-version: '17'
-        distribution: 'temurin'
-        cache: maven
-    - name: Build Project
-      run: mvn package
-    - name: Upload JAR artifact
-      uses: actions/upload-artifact@v4
-      with:
-        name: app-jar
-        path: target/*.jar 
-        
-    - uses: actions/checkout@v4
-      with:
-        # Disabling shallow clones is recommended for improving the relevancy of reporting
-        fetch-depth: 0
-    - name: SonarQube Scan
-      uses: SonarSource/sonarqube-scan-action@v5.0.0 # Ex: v4.1.0, See the latest version at https://github.com/marketplace/actions/official-sonarqube-scan
-      env:
-        SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
-        SONAR_HOST_URL: ${{ vars.SONAR_HOST_URL }}
-        
-    - name: SonarQube Quality Gate check
-      id: sonarqube-quality-gate-check
-      uses: sonarsource/sonarqube-quality-gate-action@master
-      with:
-        pollingTimeoutSec: 600
-      env:
-          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
-          SONAR_HOST_URL: ${{ vars.SONAR_HOST_URL }}
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run Trivy filesystem scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          format: 'sarif'
+          output: 'trivy-fs-results.sarif'
+          severity: 'CRITICAL,HIGH'
+          exit-code: '1'
+
+      - name: Upload Trivy filesystem results
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: 'trivy-fs-results.sarif'
+
+      - name: Trivy filesystem scan summary
+        run: |
+          trivy fs --format table --exit-code 0 --severity CRITICAL,HIGH,MEDIUM .
+
+  # ============================================================
+  # PIPELINE SUMMARY
+  # ============================================================
+  pipeline-summary:
+    name: Pipeline Summary
+    runs-on: self-hosted
+    needs: [secret-scan, sonarqube, build, filesystem-scan]
+    if: always()
+    steps:
+      - name: Check pipeline status
+        run: |
+          echo "## 🔍 CI Pipeline Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Stage | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Secret Scanning (GitLeaks) | ${{ needs.secret-scan.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| SonarQube Analysis | ${{ needs.sonarqube.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Maven Build | ${{ needs.build.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Filesystem Scan (Trivy) | ${{ needs.filesystem-scan.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [ "${{ needs.secret-scan.result }}" != "success" ] || \
+             [ "${{ needs.sonarqube.result }}" != "success" ] || \
+             [ "${{ needs.build.result }}" != "success" ] || \
+             [ "${{ needs.filesystem-scan.result }}" != "success" ]; then
+            echo "❌ Pipeline failed. Please review the failed stages." >> $GITHUB_STEP_SUMMARY
+            exit 1
+          else
+            echo "✅ All pipeline stages passed successfully!" >> $GITHUB_STEP_SUMMARY
+          fi
+
