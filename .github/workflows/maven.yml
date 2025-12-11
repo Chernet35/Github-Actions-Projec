@@ -31,7 +31,7 @@ jobs:
         run: |
           if [ ! -f ".gitleaks.toml" ]; then
             echo "⚠️ .gitleaks.toml not found. Creating default configuration..."
-            cat > .gitleaks.toml << 'GITLEAKS_EOF'
+            cat > .gitleaks.toml << 'EOF'
 # GitLeaks configuration for secret scanning
 title = "GitLeaks Secret Scanning Configuration"
 
@@ -48,7 +48,7 @@ paths = [
   '''test/''',
   '''tests/''',
 ]
-GITLEAKS_EOF
+EOF
             echo "✅ Created default .gitleaks.toml"
           fi
 
