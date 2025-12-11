@@ -1,191 +1,60 @@
-name: CI Pipeline - Security & Quality Gates
+name: CI Pipeline
 
 on:
   push:
-    branches: [main, develop]
+    branches: [ main, develop, 'release/**' ]
   pull_request:
-    branches: [main, develop]
+    branches: [ main, develop ]
   workflow_dispatch:
 
 env:
-  MAVEN_OPTS: "-Dmaven.repo.local=${{ github.workspace }}/.m2/repository"
-  SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
-  SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL || 'https://sonarcloud.io' }}
+  JAVA_VERSION: '17'
+  MAVEN_VERSION: '3.9.5'
+  SONARQUBE_TOKEN: ${{ secrets.SONARQUBE_TOKEN }}
+  SONARQUBE_URL: ${{ secrets.SONARQUBE_URL }}
 
 jobs:
-  # Secret scanning with GitLeaks - runs first and in parallel
+  # ============================================================
+  # SECRET SCANNING - GitLeaks
+  # ============================================================
   secret-scan:
-    name: GitLeaks Secret Scan
-    runs-on: ubuntu-latest
+    name: Secret Scanning (GitLeaks)
+    runs-on: self-hosted
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
           fetch-depth: 0  # Full history for GitLeaks
 
-      - name: Run GitLeaks secret scan
+      - name: Run GitLeaks
         uses: gitleaks/gitleaks-action@v2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        continue-on-error: true  # Don't fail pipeline, but report findings
-
-      - name: Upload GitLeaks report
-        if: always()
-        uses: actions/upload-artifact@v4
         with:
-          name: gitleaks-report
-          path: |
-            gitleaks-report.json
-            gitleaks-report.sarif
-          retention-days: 30
-          if-no-files-found: ignore
+          config-path: .gitleaks.toml
+          no-git: false
+          exit-code: 1
+          severity-threshold: high
 
-  # Build and test with Maven across multiple Java versions
-  build:
-    name: Maven Build (Java ${{ matrix.java-version }})
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        java-version: [17, 21]
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Set up JDK ${{ matrix.java-version }}
-        uses: actions/setup-java@v4
-        with:
-          java-version: ${{ matrix.java-version }}
-          distribution: 'temurin'
-          cache: 'maven'
-
-      - name: Cache Maven dependencies
-        uses: actions/cache@v4
-        with:
-          path: ~/.m2
-          key: ${{ runner.os }}-m2-${{ hashFiles('**/pom.xml') }}
-          restore-keys: |
-            ${{ runner.os }}-m2-
-
-      - name: Build with Maven
-        run: |
-          mvn clean compile test-compile -DskipTests
-          echo "Build completed for Java ${{ matrix.java-version }}"
-
-      - name: Run tests
-        run: mvn test
-        continue-on-error: true
-
-      - name: Package application
-        run: mvn package -DskipTests
-        continue-on-error: true
-
-      - name: Upload test results
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: test-results-java-${{ matrix.java-version }}
-          path: |
-            **/target/surefire-reports/**/*.xml
-            **/target/surefire-reports/**/*.txt
-          retention-days: 30
-          if-no-files-found: ignore
-
-      - name: Upload build artifacts
-        if: matrix.java-version == '21' && always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: build-artifacts
-          path: |
-            **/target/*.jar
-            **/target/*.war
-          retention-days: 7
-          if-no-files-found: ignore
-
-  # Container vulnerability scanning with Trivy
-  container-scan:
-    name: Trivy Container Scan
-    runs-on: ubuntu-latest
-    needs: [build]
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Set up JDK
-        uses: actions/setup-java@v4
-        with:
-          java-version: '21'
-          distribution: 'temurin'
-          cache: 'maven'
-
-      - name: Build Docker image (if Dockerfile exists)
-        id: build-image
-        run: |
-          if [ -f Dockerfile ]; then
-            docker build -t app-image:latest .
-            echo "image=app-image:latest" >> $GITHUB_OUTPUT
-            echo "image-built=true" >> $GITHUB_OUTPUT
-          else
-            echo "image-built=false" >> $GITHUB_OUTPUT
-            echo "No Dockerfile found, skipping container scan"
-          fi
-        continue-on-error: true
-
-      - name: Run Trivy vulnerability scanner
-        if: steps.build-image.outputs.image-built == 'true'
-        uses: aquasecurity/trivy-action@master
-        with:
-          image-ref: ${{ steps.build-image.outputs.image }}
-          format: 'sarif'
-          output: 'trivy-results.sarif'
-          severity: 'CRITICAL,HIGH,MEDIUM'
-          exit-code: '0'  # Don't fail on findings, report them
-          scan-type: 'image'
-
-      - name: Upload Trivy results to GitHub Security
-        if: steps.build-image.outputs.image-built == 'true' && always()
-        uses: github/codeql-action/upload-sarif@v3
-        with:
-          sarif_file: 'trivy-results.sarif'
-          wait-for-processing: false
-
-      - name: Upload Trivy report artifact
-        if: steps.build-image.outputs.image-built == 'true' && always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: trivy-scan-report
-          path: trivy-results.sarif
-          retention-days: 30
-          if-no-files-found: ignore
-
-      - name: Generate Trivy summary
-        if: steps.build-image.outputs.image-built == 'true' && always()
-        run: |
-          if [ -f trivy-results.sarif ]; then
-            echo "## 🔍 Trivy Container Scan Results" >> $GITHUB_STEP_SUMMARY
-            echo "Container image scanned: ${{ steps.build-image.outputs.image }}" >> $GITHUB_STEP_SUMMARY
-            echo "Report uploaded as artifact: trivy-scan-report" >> $GITHUB_STEP_SUMMARY
-            echo "✅ Scan completed. Review findings in Security tab." >> $GITHUB_STEP_SUMMARY
-          fi
-
-  # Code quality analysis with SonarQube
-  sonarqube-analysis:
-    name: SonarQube Code Quality Analysis
-    runs-on: ubuntu-latest
-    needs: [build]
+  # ============================================================
+  # CODE QUALITY - SonarQube
+  # ============================================================
+  sonarqube:
+    name: SonarQube Analysis
+    runs-on: self-hosted
+    needs: secret-scan
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
           fetch-depth: 0  # Shallow clones should be disabled for better analysis
 
-      - name: Set up JDK
+      - name: Set up JDK ${{ env.JAVA_VERSION }}
         uses: actions/setup-java@v4
         with:
-          java-version: '21'
+          java-version: ${{ env.JAVA_VERSION }}
           distribution: 'temurin'
-          cache: 'maven'
+          cache: maven
 
       - name: Cache Maven dependencies
         uses: actions/cache@v4
@@ -195,149 +64,157 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-m2-
 
-      - name: Run SonarQube analysis
+      - name: Download Maven dependencies
+        run: mvn dependency:go-offline -B
+
+      - name: Build with Maven
+        run: mvn clean compile -B
+
+      - name: Run SonarQube Scanner
         uses: sonarsource/sonarqube-scan-action@master
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          SONAR_TOKEN: ${{ env.SONAR_TOKEN }}
-          SONAR_HOST_URL: ${{ env.SONAR_HOST_URL }}
-        continue-on-error: true
+          SONAR_TOKEN: ${{ env.SONARQUBE_TOKEN }}
+        with:
+          args: >
+            -Dsonar.projectKey=${{ secrets.SONAR_PROJECT_KEY }}
+            -Dsonar.organization=${{ secrets.SONAR_ORGANIZATION }}
+            -Dsonar.host.url=${{ env.SONARQUBE_URL }}
+            -Dsonar.java.binaries=target/classes
+            -Dsonar.sources=src
+            -Dsonar.exclusions=**/test/**,**/*Test.java
 
-      - name: Wait for SonarQube quality gate
-        id: sonarqube-quality-gate
+      - name: Wait for SonarQube Quality Gate
+        id: sonarqube-quality-gate-check
         uses: sonarsource/sonarqube-quality-gate-action@master
         timeout-minutes: 5
         env:
-          SONAR_TOKEN: ${{ env.SONAR_TOKEN }}
-          SONAR_HOST_URL: ${{ env.SONAR_HOST_URL }}
-        # This step will fail if quality gate doesn't pass
-        # We use continue-on-error to upload artifacts even on failure
+          SONAR_TOKEN: ${{ env.SONARQUBE_TOKEN }}
         continue-on-error: true
 
-      - name: Set quality gate status
-        if: always()
-        id: quality-gate-status
+      - name: Check Quality Gate status
+        if: steps.sonarqube-quality-gate-check.outcome == 'failure'
         run: |
-          if [ "${{ steps.sonarqube-quality-gate.outcome }}" == "success" ]; then
-            echo "status=PASS" >> $GITHUB_OUTPUT
-            echo "Quality gate passed"
-          else
-            echo "status=FAIL" >> $GITHUB_OUTPUT
-            echo "Quality gate failed or error occurred"
-            # Exit with error to fail the job if quality gate didn't pass
-            exit 1
-          fi
+          echo "❌ SonarQube Quality Gate FAILED"
+          echo "Please review the SonarQube dashboard and fix the issues."
+          exit 1
 
-      - name: Upload SonarQube report
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: sonarqube-report
-          path: |
-            .scannerwork/**
-          retention-days: 30
-          if-no-files-found: ignore
-
-      - name: Generate SonarQube summary
-        if: always()
+      - name: Quality Gate passed
+        if: steps.sonarqube-quality-gate-check.outcome == 'success'
         run: |
-          echo "## 📊 SonarQube Quality Gate Status" >> $GITHUB_STEP_SUMMARY
-          if [ "${{ steps.quality-gate-status.outputs.status }}" == "PASS" ]; then
-            echo "✅ **Quality Gate: PASSED**" >> $GITHUB_STEP_SUMMARY
-            echo "All quality checks have passed. Deployment can proceed." >> $GITHUB_STEP_SUMMARY
-          else
-            echo "❌ **Quality Gate: FAILED**" >> $GITHUB_STEP_SUMMARY
-            echo "Quality gate did not pass. Please review findings in SonarQube dashboard." >> $GITHUB_STEP_SUMMARY
-            echo "" >> $GITHUB_STEP_SUMMARY
-            echo "### Required Actions:" >> $GITHUB_STEP_SUMMARY
-            echo "1. Review quality gate details in SonarQube: ${{ env.SONAR_HOST_URL }}" >> $GITHUB_STEP_SUMMARY
-            echo "2. Address code quality issues" >> $GITHUB_STEP_SUMMARY
-            echo "3. Re-run the pipeline after fixes" >> $GITHUB_STEP_SUMMARY
-          fi
+          echo "✅ SonarQube Quality Gate PASSED"
 
-  # Quality gate enforcement - fails pipeline if SonarQube gate doesn't pass
-  quality-gate-enforcement:
-    name: Enforce Quality Gate
-    runs-on: ubuntu-latest
-    needs: [sonarqube-analysis]
-    if: always()
+  # ============================================================
+  # BUILD - Maven
+  # ============================================================
+  build:
+    name: Build Java Application
+    runs-on: self-hosted
+    needs: [secret-scan, sonarqube]
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Check SonarQube quality gate status
-        run: |
-          echo "Checking SonarQube quality gate enforcement..."
-          echo "SonarQube analysis job result: ${{ needs.sonarqube-analysis.result }}"
+      - name: Set up JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: 'temurin'
+          cache: maven
 
-      - name: Fail pipeline if quality gate not passed
-        run: |
-          # Fail the pipeline if SonarQube analysis job did not succeed
-          # The sonarqube-analysis job fails if quality gate status is NOT "PASS"
-          if [ "${{ needs.sonarqube-analysis.result }}" != "success" ]; then
-            echo "❌ Pipeline failed: SonarQube quality gate did not pass"
-            echo "Job status: ${{ needs.sonarqube-analysis.result }}"
-            echo ""
-            echo "### Quality Gate Enforcement" >> $GITHUB_STEP_SUMMARY
-            echo "The SonarQube quality gate must pass with status **'PASS'** for the pipeline to succeed." >> $GITHUB_STEP_SUMMARY
-            echo "" >> $GITHUB_STEP_SUMMARY
-            echo "### Required Actions:" >> $GITHUB_STEP_SUMMARY
-            echo "1. Review quality gate details in SonarQube dashboard: ${{ env.SONAR_HOST_URL }}" >> $GITHUB_STEP_SUMMARY
-            echo "2. Address code quality issues (coverage, code smells, bugs, security vulnerabilities)" >> $GITHUB_STEP_SUMMARY
-            echo "3. Re-run the pipeline after fixes" >> $GITHUB_STEP_SUMMARY
-            exit 1
-          else
-            echo "✅ Quality gate passed. Pipeline can proceed."
-            echo "### ✅ Quality Gate Passed" >> $GITHUB_STEP_SUMMARY
-            echo "All SonarQube quality checks have passed. Deployment can proceed." >> $GITHUB_STEP_SUMMARY
-          fi
+      - name: Cache Maven dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.m2
+          key: ${{ runner.os }}-m2-${{ hashFiles('**/pom.xml') }}
+          restore-keys: |
+            ${{ runner.os }}-m2-
 
-  # Generate comprehensive failure summary
+      - name: Download Maven dependencies
+        run: mvn dependency:go-offline -B
+
+      - name: Build with Maven
+        run: mvn clean package -B -DskipTests
+
+      - name: Run unit tests
+        run: mvn test -B
+
+      - name: Generate test report
+        uses: dorny/test-reporter@v1
+        if: success() || failure()
+        with:
+          name: Maven Tests
+          path: target/surefire-reports/*.xml
+          reporter: java-junit
+          fail-on-error: false
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: java-artifacts
+          path: |
+            target/*.jar
+            target/*.war
+          retention-days: 7
+
+  # ============================================================
+  # SECURITY SCAN - Trivy Filesystem
+  # ============================================================
+  filesystem-scan:
+    name: Filesystem Vulnerability Scan (Trivy)
+    runs-on: self-hosted
+    needs: build
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run Trivy filesystem scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          format: 'sarif'
+          output: 'trivy-fs-results.sarif'
+          severity: 'CRITICAL,HIGH'
+          exit-code: '1'
+
+      - name: Upload Trivy filesystem results
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: 'trivy-fs-results.sarif'
+
+      - name: Trivy filesystem scan summary
+        run: |
+          trivy fs --format table --exit-code 0 --severity CRITICAL,HIGH,MEDIUM .
+
+  # ============================================================
+  # PIPELINE SUMMARY
+  # ============================================================
   pipeline-summary:
     name: Pipeline Summary
-    runs-on: ubuntu-latest
-    needs: [secret-scan, build, container-scan, sonarqube-analysis, quality-gate-enforcement]
+    runs-on: self-hosted
+    needs: [secret-scan, sonarqube, build, filesystem-scan]
     if: always()
     steps:
-      - name: Generate failure summary
+      - name: Check pipeline status
         run: |
-          echo "# 🔍 CI Pipeline Execution Summary" >> $GITHUB_STEP_SUMMARY
+          echo "## 🔍 CI Pipeline Summary" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "## Job Status Overview" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "| Job | Status |" >> $GITHUB_STEP_SUMMARY
-          echo "|-----|--------|" >> $GITHUB_STEP_SUMMARY
-          echo "| GitLeaks Secret Scan | ${{ needs.secret-scan.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Stage | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Secret Scanning (GitLeaks) | ${{ needs.secret-scan.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| SonarQube Analysis | ${{ needs.sonarqube.result }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Maven Build | ${{ needs.build.result }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Trivy Container Scan | ${{ needs.container-scan.result }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| SonarQube Analysis | ${{ needs.sonarqube-analysis.result }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Quality Gate Enforcement | ${{ needs.quality-gate-enforcement.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Filesystem Scan (Trivy) | ${{ needs.filesystem-scan.result }} |" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           
-          if [ "${{ needs.quality-gate-enforcement.result }}" != "success" ]; then
-            echo "## ❌ Pipeline Failed" >> $GITHUB_STEP_SUMMARY
-            echo "" >> $GITHUB_STEP_SUMMARY
-            echo "### Failure Reason:" >> $GITHUB_STEP_SUMMARY
-            if [ "${{ needs.sonarqube-analysis.result }}" != "success" ]; then
-              echo "- SonarQube quality gate did not pass" >> $GITHUB_STEP_SUMMARY
-            fi
-            if [ "${{ needs.build.result }}" != "success" ]; then
-              echo "- Maven build failed" >> $GITHUB_STEP_SUMMARY
-            fi
-            echo "" >> $GITHUB_STEP_SUMMARY
-            echo "### Next Steps:" >> $GITHUB_STEP_SUMMARY
-            echo "1. Review artifact reports for detailed findings" >> $GITHUB_STEP_SUMMARY
-            echo "2. Address issues identified in failed jobs" >> $GITHUB_STEP_SUMMARY
-            echo "3. Re-run the pipeline after fixes" >> $GITHUB_STEP_SUMMARY
+          if [ "${{ needs.secret-scan.result }}" != "success" ] || \
+             [ "${{ needs.sonarqube.result }}" != "success" ] || \
+             [ "${{ needs.build.result }}" != "success" ] || \
+             [ "${{ needs.filesystem-scan.result }}" != "success" ]; then
+            echo "❌ Pipeline failed. Please review the failed stages." >> $GITHUB_STEP_SUMMARY
+            exit 1
           else
-            echo "## ✅ Pipeline Passed" >> $GITHUB_STEP_SUMMARY
-            echo "" >> $GITHUB_STEP_SUMMARY
-            echo "All quality checks passed. Ready for deployment." >> $GITHUB_STEP_SUMMARY
+            echo "✅ All pipeline stages passed successfully!" >> $GITHUB_STEP_SUMMARY
           fi
-          
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "## 📦 Artifacts Available" >> $GITHUB_STEP_SUMMARY
-          echo "- GitLeaks report: gitleaks-report" >> $GITHUB_STEP_SUMMARY
-          echo "- Test results: test-results-java-*" >> $GITHUB_STEP_SUMMARY
-          echo "- Trivy scan: trivy-scan-report" >> $GITHUB_STEP_SUMMARY
-          echo "- SonarQube report: sonarqube-report" >> $GITHUB_STEP_SUMMARY
+
